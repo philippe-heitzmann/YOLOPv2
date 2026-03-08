@@ -248,22 +248,29 @@ def yolopv2_preprocess(frame_bgr: np.ndarray, img_size: int = 640, stride: int =
 
 
 def yolopv2_road_mask(model, frame_bgr: np.ndarray, device, img_size: int = 640):
-    """Run YOLOPv2 and return binary road mask at original frame resolution."""
-    from utils.utils import split_for_trace_model, driving_area_mask
+    """Run YOLOPv2 and return binary road mask at original frame resolution.
 
-    tensor, (orig_h, orig_w), (proc_h, proc_w) = yolopv2_preprocess(frame_bgr, img_size)
-    tensor = tensor.to(device).float()
+    YOLOPv2's driving_area_mask() hardcodes a slice for 384x640 input,
+    so we force-resize to exactly 384x640 instead of using aspect-ratio
+    preserving preprocessing.
+    """
+    from utils.utils import driving_area_mask
+
+    orig_h, orig_w = frame_bgr.shape[:2]
+
+    # YOLOPv2 expects exactly 384x640 input
+    resized = cv2.resize(frame_bgr, (640, 384), interpolation=cv2.INTER_LINEAR)
+    img = resized[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+    tensor = torch.from_numpy(img).unsqueeze(0).to(device).float()
 
     with torch.no_grad():
         [pred, anchor_grid], seg, ll = model(tensor)
 
     da_mask = driving_area_mask(seg)  # H x W uint8, 0 or 1
 
-    # Crop padding then resize to original
-    r = min(img_size / orig_h, img_size / orig_w)
-    new_h, new_w = int(orig_h * r), int(orig_w * r)
-    da_mask_cropped = da_mask[:new_h, :new_w]
-    road_mask = cv2.resize(da_mask_cropped, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+    # Resize mask back to original frame resolution
+    road_mask = cv2.resize(da_mask.astype(np.uint8), (orig_w, orig_h),
+                           interpolation=cv2.INTER_NEAREST)
     return road_mask
 
 
