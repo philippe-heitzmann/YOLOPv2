@@ -93,7 +93,7 @@ def main():
                                        args.conf_thres, NMS_IOU_THRESH)
 
         # --- YOLOPv2 road segmentation (CPU) ---
-        road_mask = yolopv2_road_mask(yolopv2_model, frame, cpu_device, args.img_size)
+        road_mask, lane_mask = yolopv2_road_mask(yolopv2_model, frame, cpu_device, args.img_size)
 
         # --- Brake decision ---
         brake = False
@@ -109,7 +109,7 @@ def main():
             reasons = ["no pedestrian on road"]
 
         # --- Annotate & save ---
-        annotated = draw_annotated_frame(frame, road_mask, pedestrians, brake, reasons)
+        annotated = draw_annotated_frame(frame, road_mask, pedestrians, brake, reasons, lane_mask=lane_mask)
         out_path = os.path.join(args.output_dir, f"annotated_{img_name}")
         cv2.imwrite(out_path, annotated)
 

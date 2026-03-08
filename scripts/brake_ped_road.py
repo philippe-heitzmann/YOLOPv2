@@ -248,13 +248,12 @@ def yolopv2_preprocess(frame_bgr: np.ndarray, img_size: int = 640, stride: int =
 
 
 def yolopv2_road_mask(model, frame_bgr: np.ndarray, device, img_size: int = 640):
-    """Run YOLOPv2 and return binary road mask at original frame resolution.
+    """Run YOLOPv2 and return (road_mask, lane_mask) at original frame resolution.
 
-    YOLOPv2's driving_area_mask() hardcodes a slice for 384x640 input,
-    so we force-resize to exactly 384x640 instead of using aspect-ratio
-    preserving preprocessing.
+    YOLOPv2's driving_area_mask() and lane_line_mask() hardcode a slice
+    for 384x640 input, so we force-resize to exactly 384x640.
     """
-    from utils.utils import driving_area_mask
+    from utils.utils import driving_area_mask, lane_line_mask
 
     orig_h, orig_w = frame_bgr.shape[:2]
 
@@ -267,11 +266,14 @@ def yolopv2_road_mask(model, frame_bgr: np.ndarray, device, img_size: int = 640)
         [pred, anchor_grid], seg, ll = model(tensor)
 
     da_mask = driving_area_mask(seg)  # H x W uint8, 0 or 1
+    ll_mask = lane_line_mask(ll)      # H x W uint8, 0 or 1
 
-    # Resize mask back to original frame resolution
+    # Resize masks back to original frame resolution
     road_mask = cv2.resize(da_mask.astype(np.uint8), (orig_w, orig_h),
                            interpolation=cv2.INTER_NEAREST)
-    return road_mask
+    lane_mask = cv2.resize(ll_mask.astype(np.uint8), (orig_w, orig_h),
+                           interpolation=cv2.INTER_NEAREST)
+    return road_mask, lane_mask
 
 
 # =========================================================================
@@ -301,8 +303,9 @@ def draw_annotated_frame(
     pedestrians: List[Dict],
     brake: bool,
     reasons: List[str],
+    lane_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Draw road mask, pedestrian boxes, and brake/keep-driving banner."""
+    """Draw road mask, lane lines, pedestrian boxes, and brake/keep-driving banner."""
     out = frame.copy()
     img_h, img_w = out.shape[:2]
 
@@ -311,6 +314,12 @@ def draw_annotated_frame(
         green_overlay = out.copy()
         green_overlay[road_mask > 0] = (0, 200, 0)
         cv2.addWeighted(green_overlay, 0.35, out, 0.65, 0, out)
+
+    # --- Lane line overlay (yellow, semi-transparent) ---
+    if lane_mask is not None and np.any(lane_mask > 0):
+        lane_overlay = out.copy()
+        lane_overlay[lane_mask > 0] = (0, 255, 255)  # yellow in BGR
+        cv2.addWeighted(lane_overlay, 0.6, out, 0.4, 0, out)
 
     # --- Pedestrian bounding boxes ---
     for ped in pedestrians:
@@ -417,7 +426,7 @@ def main():
                                        args.conf_thres, NMS_IOU_THRESH)
 
         # --- YOLOPv2 road segmentation (CPU) ---
-        road_mask = yolopv2_road_mask(yolopv2_model, frame, cpu_device, args.img_size)
+        road_mask, lane_mask = yolopv2_road_mask(yolopv2_model, frame, cpu_device, args.img_size)
 
         # --- Brake decision ---
         brake = False
@@ -436,7 +445,7 @@ def main():
             brake_count += 1
 
         # --- Annotate ---
-        annotated = draw_annotated_frame(frame, road_mask, pedestrians, brake, reasons)
+        annotated = draw_annotated_frame(frame, road_mask, pedestrians, brake, reasons, lane_mask=lane_mask)
 
         # --- Write video ---
         if vid_writer is None:
