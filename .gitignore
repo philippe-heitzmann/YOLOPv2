@@ -1,0 +1,30 @@
+# Model weights and artifacts
+*.onnx
+*.bin
+*.pt
+*.pth
+*.tflite
+*.engine
+
+# QNN build artifacts
+qnn_build/
+
+# Calibration data
+calibration_raw/
+
+# QNN CPU inference results
+qnn_cpu_results/
+
+# Images and data files
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.raw
+
+# Compiled shared libraries
+*.so
+
+# Python
+__pycache__/
+*.pyc
