@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-brake_ped_road_images.py - Full NPU Brake Decision Pipeline on individual images.
+brake_ped_road_images.py - Brake Decision Pipeline with Depth Estimation.
 
-Combines two QNN/HTP models (both .so on NPU):
-    1. YOLOv11-Large — pedestrian detection
-    2. YOLOPv2 — drivable area segmentation + lane line detection
+Combines three models:
+    1. YOLO v8 (KITTI-trained) — pedestrian/object detection
+    2. ZoeDepth (Depth-Anything small ViT) — metric depth estimation (meters)
+    3. YOLOPv2 (QNN/HTP on NPU) — drivable area segmentation + lane line detection
 
-Logic: If any pedestrian bounding box overlaps the YOLOPv2 road mask → BRAKE.
+Logic:
+    If any pedestrian is detected at < 30 meters AND its bounding box overlaps
+    the YOLOPv2 road segmentation mask → BRAKE.  Otherwise → KEEP DRIVING.
 
 Each output frame is annotated with:
     - Green semi-transparent road mask overlay
     - Yellow lane line overlay
-    - Pedestrian bounding boxes (red if on road, green if off road)
+    - Cyan extended-road-fill overlay
+    - Pedestrian bounding boxes with distance labels
+      (red if on road AND < 30m, orange if < 30m but off road, green otherwise)
     - Large centered text banner: "BRAKE" (red) or "KEEP DRIVING" (green)
 
 Usage:
     source ~/npu_setup.sh
     python3 scripts/brake_ped_road_images.py \
         --images img1.png img2.png ... \
-        --output-dir ~/annotated_outputs/brake_ped_road_npu
+        --output-dir ~/annotated_outputs/brake_depth_ped_road
 """
 
 from __future__ import annotations
@@ -36,21 +41,23 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-YOLO_INPUT_SIZE = 640
-PERSON_CLASS_ID = 0
-PERSON_CONF_MIN = 0.25
-NMS_IOU_THRESH = 0.45
+BRAKE_DISTANCE_THRESHOLD = 30.0  # meters
 
 YOLOPV2_INPUT_H = 384
 YOLOPV2_INPUT_W = 640
 
-DEFAULT_YOLO11_MODEL = Path(os.path.expanduser("~/models/libyolo11l.so"))
+ZOEDEPTH_REPO = Path(os.path.expanduser("~/zoedepth-depth-estimation"))
+YOLO_MODEL_PATH = ZOEDEPTH_REPO / "checkpoints" / "yolo_best.pt"
+DEPTH_MODEL_PATH = f"local::{ZOEDEPTH_REPO / 'checkpoints' / 'zoedepth-depthanything-smallvit-10epochs_best.pt'}"
+DEPTH_VIT_TYPE = "small"
+DEPTH_STRATEGY = "bbox_median"
+
 DEFAULT_YOLOPV2_MODEL = Path(os.path.expanduser("~/models/yolopv2_qnn/libyolopv2.so"))
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 # =========================================================================
-# QNN initialization (shared config, two model contexts)
+# QNN initialization (YOLOPv2 on NPU)
 # =========================================================================
 
 _qnn_configured = False
@@ -76,22 +83,6 @@ def _ensure_qnn_config():
     _qnn_configured = True
 
 
-def init_qnn_yolo(model_path: Path):
-    """Load YOLOv11 .so on HTP for pedestrian detection."""
-    _ensure_qnn_config()
-    from qai_appbuilder import PerfProfile, QNNContext
-
-    class QnnYolo(QNNContext):
-        def Inference(self, input_data):
-            inputs = list(input_data) if isinstance(input_data, (list, tuple)) else [input_data]
-            return super().Inference(inputs)
-
-    model = QnnYolo("yolo11_brake", str(model_path))
-    PerfProfile.SetPerfProfileGlobal(PerfProfile.BURST)
-    print(f"YOLOv11L loaded on HTP: {model_path.name}", flush=True)
-    return model
-
-
 def init_qnn_yolopv2(model_path: Path):
     """Load YOLOPv2 .so on HTP for road segmentation + lane lines."""
     _ensure_qnn_config()
@@ -108,135 +99,121 @@ def init_qnn_yolopv2(model_path: Path):
 
 
 # =========================================================================
-# YOLOv11 — pedestrian detection
+# YOLO v8 — pedestrian detection (PyTorch / ultralytics)
 # =========================================================================
 
-def letterbox_frame(frame_bgr: np.ndarray, input_size: int = 640):
-    """Letterbox BGR frame to (input_size, input_size), return HWC float32 RGB [0,1]."""
-    orig_h, orig_w = frame_bgr.shape[:2]
-    scale = min(input_size / float(orig_w), input_size / float(orig_h))
-    nw, nh = int(orig_w * scale), int(orig_h * scale)
-    resized = cv2.resize(frame_bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    canvas = np.full((input_size, input_size, 3), 128, dtype=np.uint8)
-    dw = (input_size - nw) // 2
-    dh = (input_size - nh) // 2
-    canvas[dh:dh + nh, dw:dw + nw, :] = resized
-    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    return np.ascontiguousarray(rgb), (orig_w, orig_h)
+def init_yolo_detection(model_path: Path):
+    """Load YOLO v8 detection model (KITTI-trained)."""
+    sys.path.insert(0, str(ZOEDEPTH_REPO))
+    from ultralytics import YOLO
+    model = YOLO(model=str(model_path), task="detect")
+    print(f"YOLO detection model loaded: {model_path.name}", flush=True)
+    return model
 
 
-def run_yolo_inference(model, input_nhwc: np.ndarray):
-    """Run QNN inference; returns (boxes [4,N], scores [80,N])."""
+def run_yolo_detection(model, frame_bgr: np.ndarray) -> List[Dict]:
+    """Run YOLO detection, return list of pedestrian dicts with xyxy coords."""
+    from PIL import Image
+    # KITTI class names from the zoedepth repo
+    KITTI_CLASS_NAMES = [
+        "Car", "Pedestrian", "Van", "Cyclist", "Truck",
+        "Misc", "Tram", "Person_sitting", "DontCare",
+    ]
+
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+
+    results = model(pil_img, verbose=False)
+    img_result = results[0].cpu()
+    boxes = img_result.boxes
+
+    detections = []
+    for i, cls_idx in enumerate(boxes.cls.int()):
+        idx = cls_idx.item()
+        if idx >= len(KITTI_CLASS_NAMES):
+            continue
+        class_name = KITTI_CLASS_NAMES[idx]
+        xyxy = boxes.xyxy[i].tolist()
+        conf = float(boxes.conf[i])
+        detections.append({
+            "x1": xyxy[0], "y1": xyxy[1], "x2": xyxy[2], "y2": xyxy[3],
+            "class_name": class_name,
+            "conf": conf,
+            "xyxy": xyxy,
+        })
+    return detections
+
+
+# =========================================================================
+# ZoeDepth — metric depth estimation (PyTorch)
+# =========================================================================
+
+def init_depth_model(pretrained_resource: str, vit_type: str):
+    """Load ZoeDepth metric depth model.
+
+    The internal DINOv2 backbone uses torch.hub.load with a relative path,
+    so we temporarily chdir into the zoedepth repo root during model init.
+    """
+    sys.path.insert(0, str(ZOEDEPTH_REPO))
+    from distance_estimation.depth_prediction.predict_depth_metric import load_depth_model
+
+    prev_cwd = os.getcwd()
+    os.chdir(str(ZOEDEPTH_REPO))
     try:
-        outputs = model.Inference(input_nhwc)
-    except Exception:
-        x_nchw = np.transpose(input_nhwc[0], (2, 0, 1))[np.newaxis, ...]
-        outputs = model.Inference(np.ascontiguousarray(x_nchw))
-
-    outs = list(outputs.values()) if isinstance(outputs, dict) else list(outputs)
-    tensors = [np.squeeze(np.asarray(o, dtype=np.float32)) for o in outs]
-
-    if len(tensors) == 1:
-        t = tensors[0]
-        n = t.size
-        if n % 84 == 0:
-            N = n // 84
-            combined = t.reshape(84, N) if t.shape[0] == 84 else t.reshape(N, 84).T
-            return combined[:4], combined[4:]
-        if n % 85 == 0:
-            N = n // 85
-            combined = t.reshape(85, N) if t.shape[0] == 85 else t.reshape(N, 85).T
-            return combined[:4], combined[5:]
-
-    boxes_t = scores_t = None
-    for t in tensors:
-        if t.size == 4 * 8400:
-            boxes_t = t
-        elif t.size == 80 * 8400:
-            scores_t = t
-    if boxes_t is None or scores_t is None and len(tensors) >= 2:
-        a, b = tensors[0], tensors[1]
-        if a.size < b.size:
-            boxes_t, scores_t = a, b
-        else:
-            scores_t, boxes_t = a, b
-
-    return boxes_t.reshape(4, -1), scores_t.reshape(80, -1)
+        model = load_depth_model(pretrained_resource=pretrained_resource,
+                                 vit_encoder_type=vit_type)
+    finally:
+        os.chdir(prev_cwd)
+    print(f"ZoeDepth metric depth model loaded (ViT-{vit_type})", flush=True)
+    return model
 
 
-def _is_xyxy(box_coords):
-    if len(box_coords) < 2:
-        return False
-    check = (box_coords[:, 2] > box_coords[:, 0]) & (box_coords[:, 3] > box_coords[:, 1])
-    return check.mean() > 0.95
+def run_depth_estimation(model, frame_bgr: np.ndarray) -> np.ndarray:
+    """Run depth estimation, return depth map in meters at original resolution."""
+    from PIL import Image
+    sys.path.insert(0, str(ZOEDEPTH_REPO))
+    from distance_estimation.depth_prediction.predict_depth_metric import process_image
+
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+    depth_map = process_image(model=model, image=pil_img)
+    return depth_map  # shape (H, W), values in meters
 
 
-def _xyxy_to_cxcywh(boxes):
-    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    return np.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], axis=1)
+def get_pedestrian_distance(depth_map: np.ndarray, xyxy: List[float],
+                            strategy: str = "bbox_median") -> float:
+    """Extract distance in meters for a detection bounding box."""
+    x1, y1, x2, y2 = map(int, xyxy)
+    h, w = depth_map.shape[:2]
+    x1 = max(0, min(w, x1))
+    y1 = max(0, min(h, y1))
+    x2 = max(0, min(w, x2))
+    y2 = max(0, min(h, y2))
 
+    if x2 <= x1 or y2 <= y1:
+        return float("inf")
 
-def _nms(boxes, scores, iou_thresh):
-    if len(boxes) == 0:
-        return []
-    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-    x1 = cx - w / 2; y1 = cy - h / 2; x2 = cx + w / 2; y2 = cy + h / 2
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-    keep = []
-    while order.size > 0:
-        i = order[0]; keep.append(i)
-        if order.size == 1: break
-        xx1 = np.maximum(x1[i], x1[order[1:]]); yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]]); yy2 = np.minimum(y2[i], y2[order[1:]])
-        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-        order = order[np.where(iou <= iou_thresh)[0] + 1]
-    return keep
+    region = depth_map[y1:y2, x1:x2]
+    if region.size == 0:
+        return float("inf")
 
+    region_type, method = strategy.split("_")
+    if region_type == "center":
+        ch = region.shape[0]
+        cw = region.shape[1]
+        region = region[ch // 4: ch * 3 // 4, cw // 4: cw * 3 // 4]
+        if region.size == 0:
+            return float("inf")
 
-def postprocess_yolo(boxes_4n, scores_80n, orig_size, conf_thresh, iou_thresh):
-    """Returns list of pedestrian dicts [{x1, y1, x2, y2, conf}, ...]."""
-    combined = np.concatenate([boxes_4n, scores_80n], axis=0).T
-    box_coords = combined[:, :4]
-    class_scores = combined[:, 4:]
-
-    if _is_xyxy(box_coords):
-        box_coords = _xyxy_to_cxcywh(box_coords)
-
-    person_scores = class_scores[:, PERSON_CLASS_ID]
-    mask = person_scores > conf_thresh
-    if not mask.any():
-        return []
-
-    filt_boxes = box_coords[mask]
-    filt_scores = person_scores[mask]
-
-    keep = _nms(filt_boxes, filt_scores, iou_thresh)
-    if not keep:
-        return []
-    filt_boxes = filt_boxes[keep]
-    filt_scores = filt_scores[keep]
-
-    orig_w, orig_h = orig_size
-    scale = min(YOLO_INPUT_SIZE / orig_w, YOLO_INPUT_SIZE / orig_h)
-    pad_w = (YOLO_INPUT_SIZE - orig_w * scale) / 2
-    pad_h = (YOLO_INPUT_SIZE - orig_h * scale) / 2
-
-    filt_boxes[:, 0] = (filt_boxes[:, 0] - pad_w) / scale
-    filt_boxes[:, 1] = (filt_boxes[:, 1] - pad_h) / scale
-    filt_boxes[:, 2] /= scale
-    filt_boxes[:, 3] /= scale
-
-    peds = []
-    for i in range(len(filt_boxes)):
-        cx, cy, w, h = filt_boxes[i]
-        x1 = max(0, cx - w / 2)
-        y1 = max(0, cy - h / 2)
-        x2 = min(orig_w, cx + w / 2)
-        y2 = min(orig_h, cy + h / 2)
-        peds.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": float(filt_scores[i])})
-    return peds
+    if method == "mean":
+        return float(np.mean(region))
+    elif method == "median":
+        return float(np.median(region))
+    elif method == "min":
+        return float(np.min(region))
+    elif method == "percentile":
+        return float(np.percentile(region, 25))
+    return float(np.median(region))
 
 
 # =========================================================================
@@ -271,7 +248,7 @@ def run_yolopv2_inference(model, input_nhwc: np.ndarray):
     return da_seg, ll_seg
 
 
-def postprocess_masks(da_seg, ll_seg, orig_h, orig_w, morph_close_kernel: int = 25):
+def postprocess_masks(da_seg, ll_seg, orig_h, orig_w, morph_close_kernel: int = 30):
     """Convert raw QNN outputs to binary road + lane masks at original resolution."""
     if da_seg is not None:
         da_mask = np.argmax(da_seg[0], axis=-1).astype(np.uint8)
@@ -292,6 +269,97 @@ def postprocess_masks(da_seg, ll_seg, orig_h, orig_w, morph_close_kernel: int = 
         lane_mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
     return road_mask, lane_mask
+
+
+def extend_road_mask_between_lanes(road_mask: np.ndarray, lane_mask: np.ndarray):
+    """Extend road mask using adjacent lane lines to fill occlusion gaps."""
+    road_ext = road_mask.copy()
+    lane_ext = lane_mask.copy() if lane_mask is not None else None
+
+    if lane_mask is None or not np.any(lane_mask):
+        return road_ext, lane_ext
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        lane_mask, connectivity=8
+    )
+
+    MIN_AREA = 500
+    segments = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < MIN_AREA:
+            continue
+        x_left = stats[i, cv2.CC_STAT_LEFT]
+        x_right = x_left + stats[i, cv2.CC_STAT_WIDTH] - 1
+        y_top = stats[i, cv2.CC_STAT_TOP]
+        y_bottom = y_top + stats[i, cv2.CC_STAT_HEIGHT] - 1
+        seg_pixels = np.where(labels == i)
+        bottom_quarter_y = y_bottom - max(1, (y_bottom - y_top) // 4)
+        bottom_mask = seg_pixels[0] >= bottom_quarter_y
+        median_x_bottom = int(np.median(seg_pixels[1][bottom_mask])) if np.any(bottom_mask) else int(centroids[i][0])
+        bottom_row_mask = seg_pixels[0] == y_bottom
+        if np.any(bottom_row_mask):
+            bottom_xs = seg_pixels[1][bottom_row_mask]
+            bottom_width = int(bottom_xs.max() - bottom_xs.min()) + 1
+        else:
+            bottom_width = stats[i, cv2.CC_STAT_WIDTH]
+        segments.append({
+            "label": i, "area": area,
+            "x_center": centroids[i][0],
+            "x_left": x_left, "x_right": x_right,
+            "y_top": y_top, "y_bottom": y_bottom,
+            "height": y_bottom - y_top + 1,
+            "median_x_bottom": median_x_bottom,
+            "bottom_width": bottom_width,
+        })
+
+    if len(segments) < 2:
+        return road_ext, lane_ext
+
+    segments.sort(key=lambda s: s["x_center"])
+    MIN_HEIGHT_DIFF_RATIO = 0.15
+
+    for i in range(len(segments) - 1):
+        seg_l = segments[i]
+        seg_r = segments[i + 1]
+
+        between = False
+        for j in range(len(segments)):
+            if j == i or j == i + 1:
+                continue
+            if seg_l["x_center"] < segments[j]["x_center"] < seg_r["x_center"]:
+                between = True
+                break
+        if between:
+            continue
+
+        h_l = seg_l["height"]
+        h_r = seg_r["height"]
+        max_h = max(h_l, h_r)
+        diff = abs(h_l - h_r)
+        if diff < max_h * MIN_HEIGHT_DIFF_RATIO:
+            continue
+
+        target_bottom = max(seg_l["y_bottom"], seg_r["y_bottom"])
+        fill_top = min(seg_l["y_top"], seg_r["y_top"])
+        fill_x_left = seg_l["x_right"]
+        fill_x_right = seg_r["x_left"]
+        if fill_x_right <= fill_x_left:
+            continue
+
+        road_ext[fill_top:target_bottom + 1, fill_x_left:fill_x_right + 1] = 1
+
+        if lane_ext is not None:
+            shorter = seg_l if h_l < h_r else seg_r
+            shorter_bottom = shorter["y_bottom"]
+            if shorter_bottom < target_bottom:
+                cx = shorter["median_x_bottom"]
+                half_w = max(2, shorter["bottom_width"] // 2)
+                x1 = max(0, cx - half_w)
+                x2 = min(lane_ext.shape[1] - 1, cx + half_w)
+                lane_ext[shorter_bottom:target_bottom + 1, x1:x2 + 1] = 1
+
+    return road_ext, lane_ext
 
 
 # =========================================================================
@@ -318,12 +386,14 @@ def ped_intersects_road(ped: Dict, road_mask: np.ndarray) -> bool:
 def draw_annotated_frame(
     frame: np.ndarray,
     road_mask: np.ndarray,
-    pedestrians: List[Dict],
+    detections: List[Dict],
     brake: bool,
     reasons: List[str],
     lane_mask: Optional[np.ndarray] = None,
+    road_mask_extended: Optional[np.ndarray] = None,
+    lane_mask_extended: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Draw road mask, lane lines, pedestrian boxes, and brake/keep-driving banner."""
+    """Draw road mask, lane lines, detection boxes with distance, and brake banner."""
     out = frame.copy()
     img_h, img_w = out.shape[:2]
 
@@ -333,21 +403,62 @@ def draw_annotated_frame(
         green_overlay[road_mask > 0] = (0, 200, 0)
         cv2.addWeighted(green_overlay, 0.35, out, 0.65, 0, out)
 
-    # --- Lane line overlay (yellow, semi-transparent) ---
+    # --- Extended road fill overlay (cyan) ---
+    if road_mask_extended is not None and road_mask is not None:
+        ext_only = (road_mask_extended > 0) & (road_mask == 0)
+        if np.any(ext_only):
+            cyan_overlay = out.copy()
+            cyan_overlay[ext_only] = (200, 200, 0)
+            cv2.addWeighted(cyan_overlay, 0.45, out, 0.55, 0, out)
+
+    # --- Lane line overlay (yellow) ---
     if lane_mask is not None and np.any(lane_mask > 0):
         lane_overlay = out.copy()
         lane_overlay[lane_mask > 0] = (0, 255, 255)
         cv2.addWeighted(lane_overlay, 0.6, out, 0.4, 0, out)
 
-    # --- Pedestrian bounding boxes ---
-    for ped in pedestrians:
-        on_road = ped.get("on_road", False)
-        color = (0, 0, 255) if on_road else (0, 255, 0)
-        x1, y1, x2, y2 = int(ped["x1"]), int(ped["y1"]), int(ped["x2"]), int(ped["y2"])
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"ped {ped['conf']:.2f}" + (" ON ROAD" if on_road else "")
-        cv2.putText(out, label, (x1, max(y1 - 6, 12)),
-                    _FONT, 0.5, color, 1, cv2.LINE_AA)
+    # --- Extended lane line overlay (magenta) ---
+    if lane_mask_extended is not None and lane_mask is not None:
+        lane_ext_only = (lane_mask_extended > 0) & (lane_mask == 0)
+        if np.any(lane_ext_only):
+            magenta_overlay = out.copy()
+            magenta_overlay[lane_ext_only] = (255, 0, 255)
+            cv2.addWeighted(magenta_overlay, 0.7, out, 0.3, 0, out)
+
+    # --- Detection bounding boxes ---
+    for det in detections:
+        class_name = det.get("class_name", "")
+        is_ped = class_name in ("Pedestrian", "Cyclist", "Person_sitting")
+        on_road = det.get("on_road", False)
+        distance = det.get("distance", float("inf"))
+        in_range = distance < BRAKE_DISTANCE_THRESHOLD
+
+        if is_ped and on_road and in_range:
+            color = (0, 0, 255)      # Red — brake trigger
+            thickness = 3
+        elif is_ped and in_range:
+            color = (0, 165, 255)    # Orange — close but off road
+            thickness = 2
+        elif is_ped:
+            color = (0, 255, 0)      # Green — far pedestrian
+            thickness = 2
+        else:
+            color = (255, 180, 0)    # Blue — non-pedestrian
+            thickness = 1
+
+        x1, y1, x2, y2 = int(det["x1"]), int(det["y1"]), int(det["x2"]), int(det["y2"])
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+
+        dist_str = f"{distance:.1f}m" if distance < 200 else "?"
+        label = f"{class_name} {det['conf']:.2f} {dist_str}"
+        if is_ped and on_road and in_range:
+            label += " ON ROAD"
+
+        # Label background
+        (tw, th), _ = cv2.getTextSize(label, _FONT, 0.5, 1)
+        cv2.rectangle(out, (x1, max(y1 - th - 8, 0)), (x1 + tw + 4, max(y1 - 2, 0)), color, -1)
+        cv2.putText(out, label, (x1 + 2, max(y1 - 4, 12)),
+                    _FONT, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # --- Banner ---
     main_text = "BRAKE" if brake else "KEEP DRIVING"
@@ -390,22 +501,31 @@ def draw_annotated_frame(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Full NPU Brake Decision: YOLOv11L (ped detection) + YOLOPv2 (road seg)")
+        description="Brake Decision: YOLO (detection) + ZoeDepth (distance) + YOLOPv2 (road seg)")
     parser.add_argument("--images", nargs="+", required=True, help="Image paths")
     parser.add_argument("--output-dir", type=str, required=True)
-    parser.add_argument("--yolo-model", type=str, default=str(DEFAULT_YOLO11_MODEL))
     parser.add_argument("--yolopv2-model", type=str, default=str(DEFAULT_YOLOPV2_MODEL))
-    parser.add_argument("--conf-thres", type=float, default=PERSON_CONF_MIN)
-    parser.add_argument("--morph-close-kernel", type=int, default=25,
+    parser.add_argument("--yolo-model", type=str, default=str(YOLO_MODEL_PATH))
+    parser.add_argument("--depth-model", type=str, default=DEPTH_MODEL_PATH)
+    parser.add_argument("--depth-vit-type", type=str, default=DEPTH_VIT_TYPE,
+                        choices=["small", "large"])
+    parser.add_argument("--depth-strategy", type=str, default=DEPTH_STRATEGY,
+                        choices=["bbox_mean", "bbox_median", "bbox_min", "bbox_percentile",
+                                 "center_mean", "center_median", "center_min", "center_percentile"])
+    parser.add_argument("--brake-distance", type=float, default=BRAKE_DISTANCE_THRESHOLD,
+                        help="Brake if pedestrian closer than this (meters)")
+    parser.add_argument("--morph-close-kernel", type=int, default=30,
                         help="Kernel size for morphological closing on road mask (0=disable)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    brake_dist = args.brake_distance
 
-    # --- Init both models on NPU ---
-    yolo_model = init_qnn_yolo(Path(args.yolo_model))
+    # --- Init models ---
+    yolo_model = init_yolo_detection(Path(args.yolo_model))
+    depth_model = init_depth_model(args.depth_model, args.depth_vit_type)
     yolopv2_model = init_qnn_yolopv2(Path(args.yolopv2_model))
-    print("Both models loaded on HTP.\n", flush=True)
+    print("All three models loaded.\n", flush=True)
 
     for img_path in args.images:
         img_name = Path(img_path).name
@@ -419,12 +539,16 @@ def main():
         orig_h, orig_w = frame.shape[:2]
         t0 = time.perf_counter()
 
-        # --- YOLOv11 pedestrian detection (NPU) ---
-        yolo_input, orig_size = letterbox_frame(frame, YOLO_INPUT_SIZE)
-        yolo_input_batch = np.expand_dims(yolo_input, axis=0)
-        boxes_4n, scores_80n = run_yolo_inference(yolo_model, yolo_input_batch)
-        pedestrians = postprocess_yolo(boxes_4n, scores_80n, orig_size,
-                                       args.conf_thres, NMS_IOU_THRESH)
+        # --- YOLO detection (all classes) ---
+        detections = run_yolo_detection(yolo_model, frame)
+
+        # --- ZoeDepth metric depth estimation ---
+        depth_map = run_depth_estimation(depth_model, frame)
+
+        # Assign distance to each detection
+        for det in detections:
+            det["distance"] = get_pedestrian_distance(
+                depth_map, det["xyxy"], strategy=args.depth_strategy)
 
         # --- YOLOPv2 road segmentation + lane lines (NPU) ---
         yolopv2_input = preprocess_yolopv2(frame)
@@ -432,28 +556,47 @@ def main():
         road_mask, lane_mask = postprocess_masks(da_seg, ll_seg, orig_h, orig_w,
                                                  morph_close_kernel=args.morph_close_kernel)
 
+        # --- Extend road mask using lane lines ---
+        road_mask_extended, lane_mask_extended = extend_road_mask_between_lanes(road_mask, lane_mask)
+
         # --- Brake decision ---
+        # Only pedestrians/cyclists/person_sitting trigger braking
         brake = False
         reasons = []
-        for ped in pedestrians:
-            on_road = ped_intersects_road(ped, road_mask)
-            ped["on_road"] = on_road
-            if on_road:
-                brake = True
-                reasons.append(f"pedestrian in road region (conf={ped['conf']:.2f})")
+        ped_classes = {"Pedestrian", "Cyclist", "Person_sitting"}
+
+        for det in detections:
+            on_road = ped_intersects_road(det, road_mask_extended)
+            det["on_road"] = on_road
+
+            if det["class_name"] in ped_classes:
+                dist = det["distance"]
+                if on_road and dist < brake_dist:
+                    brake = True
+                    reasons.append(
+                        f"{det['class_name'].lower()} at {dist:.1f}m on road "
+                        f"(conf={det['conf']:.2f})")
 
         if not brake:
-            reasons = ["no pedestrian on road"]
+            reasons = [f"no pedestrian on road within {brake_dist:.0f}m"]
 
         # --- Annotate & save ---
-        annotated = draw_annotated_frame(frame, road_mask, pedestrians, brake, reasons,
-                                         lane_mask=lane_mask)
+        annotated = draw_annotated_frame(frame, road_mask, detections, brake, reasons,
+                                         lane_mask=lane_mask,
+                                         road_mask_extended=road_mask_extended,
+                                         lane_mask_extended=lane_mask_extended)
         out_path = os.path.join(args.output_dir, f"annotated_{img_name}")
         cv2.imwrite(out_path, annotated)
 
         t1 = time.perf_counter()
         cmd = "BRAKE" if brake else "KEEP DRIVING"
-        print(f"  {cmd} | peds={len(pedestrians)} | {(t1-t0)*1000:.0f}ms | saved: {out_path}",
+        n_peds = sum(1 for d in detections if d["class_name"] in ped_classes)
+        n_on_road = sum(1 for d in detections
+                        if d["class_name"] in ped_classes
+                        and d.get("on_road") and d["distance"] < brake_dist)
+        print(f"  {cmd} | total_det={len(detections)} peds={n_peds} "
+              f"peds_on_road_<{brake_dist:.0f}m={n_on_road} | "
+              f"{(t1-t0)*1000:.0f}ms | saved: {out_path}",
               flush=True)
 
     print(f"\nDone! {len(args.images)} images processed.", flush=True)
